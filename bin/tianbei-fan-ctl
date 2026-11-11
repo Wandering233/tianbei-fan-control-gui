@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+Privileged Lifecycle Helper for TianBei MACO Fan Control (invoked via pkexec).
+Handles starting/stopping the transient systemd daemon unit, loading the it87
+driver, and installing/uninstalling persistent system boot integration.
+"""
+
+import argparse
+import json
+import os
+import platform
+import pwd
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DAEMON_BIN = os.path.join(BASE_DIR, "bin", "tianbei-fan-daemon")
+PROJECT_KO = os.path.join(BASE_DIR, "driver", "it87", "it87.ko")
+SOCK_PATH = "/run/tianbei-fan/control.sock"
+
+UNIT_NAME = "tianbei-fan-daemon.service"
+SERVICE_PATH = f"/etc/systemd/system/{UNIT_NAME}"
+MODPROBE_CONF = "/etc/modprobe.d/tianbei-it87.conf"
+MODULES_LOAD_CONF = "/etc/modules-load.d/tianbei-it87.conf"
+DEPMOD_CONF = "/etc/depmod.d/tianbei-it87.conf"
+
+
+def _resolve_target_user(explicit_uid: int | None) -> tuple[int, int, str]:
+    uid = explicit_uid
+    if uid is None:
+        pk_uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+        uid = int(pk_uid) if pk_uid else 1000
+    pw = pwd.getpwuid(uid)
+    return pw.pw_uid, pw.pw_gid, pw.pw_dir
+
+
+def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if check and res.returncode != 0:
+        raise RuntimeError(f"命令失败 ({' '.join(cmd)}): {res.stderr.strip() or res.stdout.strip()}")
+    return res
+
+
+def _ping_socket(timeout_s: float = 0.4) -> bool:
+    if not os.path.exists(SOCK_PATH):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout_s)
+            s.connect(SOCK_PATH)
+            s.sendall(b'{"cmd":"ping"}\n')
+            data = s.recv(4096)
+            return b'"ok": true' in data or b'"ok":true' in data
+    except OSError:
+        return False
+
+
+def _wait_socket(seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _ping_socket():
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _ensure_dir_writable(path: str, uid: int, gid: int) -> None:
+    os.makedirs(path, exist_ok=True)
+    os.chown(path, uid, gid)
+
+
+def cmd_start_transient(uid: int, gid: int, config_path: str) -> None:
+    if _ping_socket():
+        print("ALREADY_RUNNING")
+        return
+
+    # Stop any leftover failed transient unit cleanly
+    _run(["systemctl", "stop", UNIT_NAME], check=False)
+    _run(["systemctl", "reset-failed", UNIT_NAME], check=False)
+
+    # If persistent systemd service is installed, simply start it
+    if os.path.exists(SERVICE_PATH):
+        _run(["systemctl", "start", UNIT_NAME])
+    else:
+        _run([
+            "systemd-run",
+            f"--unit={UNIT_NAME}",
+            "--description=TianBei MACO Fan Control Daemon (Transient)",
+            "--property=KillMode=mixed",
+            "--property=TimeoutStopSec=10",
+            sys.executable,
+            DAEMON_BIN,
+            "--socket", SOCK_PATH,
+            "--config", config_path,
+            "--uid", str(uid),
+            "--gid", str(gid),
+        ])
+
+    if not _wait_socket(6.0):
+        logs = _run(["journalctl", "-u", UNIT_NAME, "-n", "20", "--no-pager"], check=False)
+        raise RuntimeError(f"守护进程启动超时。\n{logs.stdout.strip()}")
+    print("STARTED")
+
+
+def cmd_stop_daemon() -> None:
+    if _ping_socket():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(SOCK_PATH)
+                s.sendall(b'{"cmd":"shutdown"}\n')
+                s.recv(4096)
+        except OSError:
+            pass
+    _run(["systemctl", "stop", UNIT_NAME], check=False)
+    _run(["systemctl", "reset-failed", UNIT_NAME], check=False)
+    print("STOPPED")
+
+
+def cmd_install_system(uid: int, gid: int, config_path: str) -> None:
+    if not os.path.exists(PROJECT_KO):
+        raise RuntimeError(f"未找到驱动模块 {PROJECT_KO}，请先编译驱动。")
+
+    kver = platform.release()
+    updates_dir = f"/lib/modules/{kver}/updates"
+    os.makedirs(updates_dir, exist_ok=True)
+    shutil.copy2(PROJECT_KO, os.path.join(updates_dir, "it87.ko"))
+
+    os.makedirs("/etc/depmod.d", exist_ok=True)
+    with open(DEPMOD_CONF, "w", encoding="utf-8") as f:
+        f.write("override it87 * updates\noverride it87 * extra\n")
+
+    os.makedirs("/etc/modprobe.d", exist_ok=True)
+    with open(MODPROBE_CONF, "w", encoding="utf-8") as f:
+        f.write("options it87 ignore_resource_conflict=1\n")
+
+    os.makedirs("/etc/modules-load.d", exist_ok=True)
+    with open(MODULES_LOAD_CONF, "w", encoding="utf-8") as f:
+        f.write("it87\n")
+
+    _run(["depmod", "-a"])
+
+    # If transient unit is running, stop it before installing persistent unit
+    _run(["systemctl", "stop", UNIT_NAME], check=False)
+    _run(["systemctl", "reset-failed", UNIT_NAME], check=False)
+
+    service_body = f"""[Unit]
+Description=TianBei MACO Live Fan Control Daemon (IT8613E)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {DAEMON_BIN} --socket {SOCK_PATH} --config {config_path} --uid {uid} --gid {gid} --apply-saved
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open(SERVICE_PATH, "w", encoding="utf-8") as f:
+        f.write(service_body)
+
+    _run(["systemctl", "daemon-reload"])
+    _run(["systemctl", "enable", "--now", UNIT_NAME])
+
+    if not _wait_socket(6.0):
+        raise RuntimeError("开机服务已写入，但启动连接超时。")
+    print("INSTALLED")
+
+
+def cmd_uninstall_system() -> None:
+    if os.path.exists(SERVICE_PATH):
+        _run(["systemctl", "disable", "--now", UNIT_NAME], check=False)
+        os.unlink(SERVICE_PATH)
+        _run(["systemctl", "daemon-reload"], check=False)
+    else:
+        _run(["systemctl", "stop", UNIT_NAME], check=False)
+
+    kver = platform.release()
+    for p in (
+        f"/lib/modules/{kver}/updates/it87.ko",
+        DEPMOD_CONF,
+        MODPROBE_CONF,
+        MODULES_LOAD_CONF,
+    ):
+        if os.path.exists(p):
+            os.unlink(p)
+
+    _run(["depmod", "-a"], check=False)
+    print("UNINSTALLED")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TianBei Fan Control Privileged Helper")
+    parser.add_argument(
+        "action",
+        choices=["start-transient", "stop-daemon", "install-system", "uninstall-system"],
+    )
+    parser.add_argument("--uid", type=int, default=None)
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        sys.stderr.write("ERROR: Must run as root.\n")
+        sys.exit(1)
+
+    uid, gid, home_dir = _resolve_target_user(args.uid)
+    cfg_dir = os.path.join(home_dir, ".config", "tianbei-fan-control")
+    _ensure_dir_writable(cfg_dir, uid, gid)
+    cfg_path = os.path.join(cfg_dir, "config.json")
+
+    try:
+        if args.action == "start-transient":
+            cmd_start_transient(uid, gid, cfg_path)
+        elif args.action == "stop-daemon":
+            cmd_stop_daemon()
+        elif args.action == "install-system":
+            cmd_install_system(uid, gid, cfg_path)
+        elif args.action == "uninstall-system":
+            cmd_uninstall_system()
+    except Exception as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

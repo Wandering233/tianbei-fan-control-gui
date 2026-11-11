@@ -1,0 +1,22 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Kernel module build artifacts (rebuilt locally per kernel version)
+driver/it87/*.o
+driver/it87/*.ko
+driver/it87/*.mod
+driver/it87/*.mod.c
+driver/it87/*.mod.o
+driver/it87/.*.cmd
+driver/it87/modules.order
+driver/it87/Module.symvers
+driver/it87/.tmp_versions/
+driver/it87/BUILT_FOR_KERNEL
+
+# Editor & OS files
+*.swp
+*.swo
+*~
+.DS_Store
